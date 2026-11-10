@@ -1,0 +1,15 @@
+[project]
+name = "tinyserve"
+version = "0.3.0"
+description = "A small batched inference engine for decoder-only transformers"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# Ignore unrelated plugins installed in the surrounding environment.
+addopts = "-p no:logfire"

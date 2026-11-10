@@ -1,0 +1,88 @@
+--- a/interview-01-tinyserve/tests/test_kv_cache.py	2026-11-09 15:19:53
++++ b/interview-01-tinyserve/tests/test_kv_cache.py	2026-11-09 15:19:54
+@@ -29,7 +29,7 @@
+     cache.write(0, _kv(config, 2, 3, 1.0), _kv(config, 2, 3, 1.0))
+     cache.advance(3)
+     mask = cache.attention_mask(pending=1)
+-    assert mask.shape == (2, 1, 1, config.max_seq_len)
++    assert mask.shape == (2, 1, 1, 4)
+     assert mask[0, 0, 0].sum().item() == 4
+ 
+ 
+--- a/interview-01-tinyserve/tinyserve/kv_cache.py	2026-11-09 15:19:53
++++ b/interview-01-tinyserve/tinyserve/kv_cache.py	2026-11-09 15:19:58
+@@ -48,37 +48,48 @@
+         ``k`` and ``v`` have shape ``[batch, n_heads, T, head_dim]``.
+         """
+         n_new = k.shape[2]
+-        start = int(self.lengths.max())
+-        if start + n_new > self.capacity:
++        longest = int(self.lengths.max())
++        if longest + n_new > self.capacity:
+             raise ValueError(
+-                f"KV cache overflow: {start} + {n_new} > capacity {self.capacity}"
++                f"KV cache overflow: {longest} + {n_new} > capacity {self.capacity}"
+             )
+-        self.k[layer, :, :, start : start + n_new] = k
+-        self.v[layer, :, :, start : start + n_new] = v
++        # Each sequence appends at its own length, not at the batch maximum.
++        device = self.k.device
++        rows = torch.arange(self.batch_size, device=device)[:, None]
++        cols = self.lengths[:, None] + torch.arange(n_new, device=device)
++        # Indexing [rows, :, cols] yields [batch, T, n_heads, head_dim].
++        self.k[layer][rows, :, cols] = k.transpose(1, 2)
++        self.v[layer][rows, :, cols] = v.transpose(1, 2)
+ 
+     def advance(self, n: int | torch.Tensor) -> None:
+         """Mark ``n`` more positions as valid (scalar, or one count per sequence)."""
+         self.lengths = self.lengths + n
+ 
+-    def view(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+-        """Keys and values for ``layer`` as ``[batch, n_heads, capacity, head_dim]``."""
+-        return self.k[layer], self.v[layer]
++    def _window(self, pending: int) -> int:
++        """Number of leading slots that hold data for at least one sequence."""
++        return int(self.lengths.max()) + pending
+ 
++    def view(self, layer: int, pending: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
++        """Keys and values for ``layer`` as ``[batch, n_heads, window, head_dim]``.
++
++        Only the occupied prefix is returned (a view, no copy), so attention
++        cost follows the real sequence length rather than the capacity.
++        """
++        window = self._window(pending)
++        return self.k[layer, :, :, :window], self.v[layer, :, :, :window]
++
+     def attention_mask(self, pending: int = 0) -> torch.Tensor:
+-        """Boolean mask ``[batch, 1, 1, capacity]``; True where attention is allowed.
++        """Boolean mask ``[batch, 1, 1, window]``; True where attention is allowed.
+ 
+         ``pending`` counts positions written during the current step that
+         ``advance`` has not accounted for yet.
+         """
+-        mask = torch.zeros(
+-            self.batch_size, self.capacity, dtype=torch.bool, device=self.k.device
+-        )
+-        for b in range(self.batch_size):
+-            mask[b, : int(self.lengths[b]) + pending] = True
++        slots = torch.arange(self._window(pending), device=self.k.device)
++        mask = slots[None, :] < (self.lengths[:, None] + pending)
+         return mask[:, None, None, :]
+ 
+     def select(self, index: torch.Tensor) -> None:
+         """Keep only the sequences in ``index`` (used when sequences finish)."""
+         self.k = self.k[:, index]
+         self.v = self.v[:, index]
+-        self.lengths = self.lengths[: index.numel()]
++        self.lengths = self.lengths[index]
+--- a/interview-01-tinyserve/tinyserve/model.py	2026-11-09 15:19:53
++++ b/interview-01-tinyserve/tinyserve/model.py	2026-11-09 15:19:54
+@@ -37,7 +37,7 @@
+             # tokens from seeing padding.
+             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+         else:
+-            keys, values = cache.view(layer)
++            keys, values = cache.view(layer, pending=seq)
+             mask = cache.attention_mask(pending=seq)
+             out = F.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
+ 
